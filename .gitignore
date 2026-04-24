@@ -1,0 +1,17 @@
+# The embedded dylib at internal/dylib/libkinax_sync.dylib IS committed
+# (so `go get` works without downstream users building C code).
+/libkinax_sync.dylib
+*.dylib.dSYM/
+
+/vendor/
+*.test
+*.out
+coverage.txt
+
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+/kinax
