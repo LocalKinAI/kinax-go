@@ -581,3 +581,297 @@ int32_t kinax_element_set_bool(uintptr_t handle, const char *attr, int32_t value
         el, (__bridge CFStringRef)name, b);
     return (err == kAXErrorSuccess) ? 0 : (int32_t)err;
 }
+
+
+// ─── AXObserver — push-based UI event subscriptions ─────────
+//
+// kinax-go v0.3 wraps AXObserverCreate / AXObserverAddNotification /
+// AXObserverGetRunLoopSource so callers can subscribe to UI changes
+// (focus moves, value edits, window creates, etc.) and receive
+// notifications instead of polling the AX tree.
+//
+// Implementation:
+//   - Each observer owns a dedicated pthread that runs CFRunLoopRun.
+//     The AX observer's run-loop source is attached to that thread's
+//     runloop (the only thread-safe way per Apple Forums #94878).
+//   - When AX fires the C callback (on the worker thread), we copy
+//     the notification + element into a node and push to a queue
+//     guarded by pthread_mutex / pthread_cond.
+//   - Go-side calls kinax_observer_next which pthread_cond_timedwait's
+//     for up to timeout_ms, returns the head event as JSON. Element
+//     handle is CFRetain'd so Go can use it as a normal kinax_element_*
+//     handle and CFRelease it when done.
+//
+// Memory: each event node is malloc'd; freed on dequeue. Queue is
+// drained on Close (any leftover element handles CFReleased).
+
+#import <pthread.h>
+#import <errno.h>
+
+typedef struct kinax_event_node {
+    char *notification;       // strdup'd UTF-8
+    uintptr_t element_handle; // CFRetain'd AXUIElementRef
+    int64_t timestamp_ms;
+    struct kinax_event_node *next;
+} kinax_event_node;
+
+typedef struct kinax_observer_struct {
+    pid_t pid;
+    AXObserverRef axObserver;
+    pthread_t worker_thread;
+    CFRunLoopRef worker_runloop;
+
+    // Queue of pending events (FIFO).
+    pthread_mutex_t queue_mutex;
+    pthread_cond_t  queue_cond;
+    kinax_event_node *queue_head;
+    kinax_event_node *queue_tail;
+
+    // Startup synchronization — main thread waits on this until the
+    // worker has either created the AX observer (success) or marked
+    // failure. Avoids a polling loop.
+    pthread_mutex_t startup_mutex;
+    pthread_cond_t  startup_cond;
+    int started;     // 0 = not yet; 1 = success; -1 = failure
+    char start_err[256];
+} kinax_observer_struct;
+
+// AXObserver callback — runs on the worker thread because that's where
+// the runloop source is registered.
+static void kinax_ax_observer_callback(AXObserverRef observer,
+                                        AXUIElementRef element,
+                                        CFStringRef notification,
+                                        void *refcon) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)refcon;
+    if (!obs || !element || !notification) return;
+
+    kinax_event_node *node = calloc(1, sizeof(kinax_event_node));
+    if (!node) return;
+
+    NSString *nstr = (__bridge NSString *)notification;
+    const char *utf8 = nstr.UTF8String;
+    if (utf8) {
+        node->notification = strdup(utf8);
+    } else {
+        node->notification = strdup("");
+    }
+    CFRetain(element);
+    node->element_handle = (uintptr_t)element;
+    node->timestamp_ms = (int64_t)([[NSDate date] timeIntervalSince1970] * 1000.0);
+
+    pthread_mutex_lock(&obs->queue_mutex);
+    if (obs->queue_tail) {
+        obs->queue_tail->next = node;
+    } else {
+        obs->queue_head = node;
+    }
+    obs->queue_tail = node;
+    pthread_cond_signal(&obs->queue_cond);
+    pthread_mutex_unlock(&obs->queue_mutex);
+}
+
+// Worker thread entry: create AXObserver, attach to runloop, run forever.
+static void *kinax_observer_worker(void *arg) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)arg;
+
+    AXObserverRef axObs = NULL;
+    AXError err = AXObserverCreate(obs->pid, kinax_ax_observer_callback, &axObs);
+
+    pthread_mutex_lock(&obs->startup_mutex);
+    if (err != kAXErrorSuccess || !axObs) {
+        snprintf(obs->start_err, sizeof(obs->start_err),
+                 "AXObserverCreate failed (AXError=%d) — likely missing Accessibility permission",
+                 (int)err);
+        obs->started = -1;
+        pthread_cond_signal(&obs->startup_cond);
+        pthread_mutex_unlock(&obs->startup_mutex);
+        return NULL;
+    }
+    obs->axObserver = axObs;
+    obs->worker_runloop = CFRunLoopGetCurrent();
+    CFRunLoopAddSource(obs->worker_runloop,
+                       AXObserverGetRunLoopSource(axObs),
+                       kCFRunLoopDefaultMode);
+    obs->started = 1;
+    pthread_cond_signal(&obs->startup_cond);
+    pthread_mutex_unlock(&obs->startup_mutex);
+
+    // Block forever until CFRunLoopStop is called from Close().
+    CFRunLoopRun();
+
+    // Teardown after stop.
+    CFRunLoopRemoveSource(obs->worker_runloop,
+                          AXObserverGetRunLoopSource(obs->axObserver),
+                          kCFRunLoopDefaultMode);
+    CFRelease(obs->axObserver);
+    obs->axObserver = NULL;
+    obs->worker_runloop = NULL;
+    return NULL;
+}
+
+uintptr_t kinax_observer_create(int32_t pid, char *err_msg, int32_t err_len) {
+    if (pid <= 0) {
+        if (err_msg && err_len > 0) {
+            strncpy(err_msg, "invalid pid (must be > 0)", err_len - 1);
+            err_msg[err_len - 1] = 0;
+        }
+        return 0;
+    }
+    kinax_observer_struct *obs = calloc(1, sizeof(kinax_observer_struct));
+    if (!obs) return 0;
+    obs->pid = pid;
+    pthread_mutex_init(&obs->queue_mutex, NULL);
+    pthread_cond_init(&obs->queue_cond, NULL);
+    pthread_mutex_init(&obs->startup_mutex, NULL);
+    pthread_cond_init(&obs->startup_cond, NULL);
+
+    if (pthread_create(&obs->worker_thread, NULL, kinax_observer_worker, obs) != 0) {
+        if (err_msg && err_len > 0) {
+            strncpy(err_msg, "pthread_create failed", err_len - 1);
+            err_msg[err_len - 1] = 0;
+        }
+        pthread_mutex_destroy(&obs->queue_mutex);
+        pthread_cond_destroy(&obs->queue_cond);
+        pthread_mutex_destroy(&obs->startup_mutex);
+        pthread_cond_destroy(&obs->startup_cond);
+        free(obs);
+        return 0;
+    }
+
+    pthread_mutex_lock(&obs->startup_mutex);
+    while (obs->started == 0) {
+        pthread_cond_wait(&obs->startup_cond, &obs->startup_mutex);
+    }
+    int started = obs->started;
+    char fail_msg[256];
+    strncpy(fail_msg, obs->start_err, sizeof(fail_msg));
+    fail_msg[sizeof(fail_msg) - 1] = 0;
+    pthread_mutex_unlock(&obs->startup_mutex);
+
+    if (started < 0) {
+        if (err_msg && err_len > 0) {
+            strncpy(err_msg, fail_msg, err_len - 1);
+            err_msg[err_len - 1] = 0;
+        }
+        pthread_join(obs->worker_thread, NULL);
+        pthread_mutex_destroy(&obs->queue_mutex);
+        pthread_cond_destroy(&obs->queue_cond);
+        pthread_mutex_destroy(&obs->startup_mutex);
+        pthread_cond_destroy(&obs->startup_cond);
+        free(obs);
+        return 0;
+    }
+    return (uintptr_t)obs;
+}
+
+int32_t kinax_observer_subscribe(uintptr_t obs_handle, uintptr_t elem_handle,
+                                  const char *notification) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)obs_handle;
+    AXUIElementRef elem = (AXUIElementRef)elem_handle;
+    if (!obs || !elem || !notification) return -1;
+    NSString *notif = [NSString stringWithUTF8String:notification];
+    if (!notif) return -1;
+    AXError err = AXObserverAddNotification(
+        obs->axObserver, elem,
+        (__bridge CFStringRef)notif, obs);
+    return (err == kAXErrorSuccess) ? 0 : (int32_t)err;
+}
+
+int32_t kinax_observer_unsubscribe(uintptr_t obs_handle, uintptr_t elem_handle,
+                                    const char *notification) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)obs_handle;
+    AXUIElementRef elem = (AXUIElementRef)elem_handle;
+    if (!obs || !elem || !notification) return -1;
+    NSString *notif = [NSString stringWithUTF8String:notification];
+    if (!notif) return -1;
+    AXError err = AXObserverRemoveNotification(
+        obs->axObserver, elem,
+        (__bridge CFStringRef)notif);
+    return (err == kAXErrorSuccess) ? 0 : (int32_t)err;
+}
+
+// Block up to timeout_ms for the next event. Returns:
+//   0  = success, json_buf populated, caller owns the element_handle CFRetain
+//   -1 = timeout, no event (json_buf untouched)
+//   -2 = observer is closed / nil
+//   >0 = required json_buf size (caller resizes + retries; event stays queued)
+int32_t kinax_observer_next(uintptr_t obs_handle, int32_t timeout_ms,
+                             char *json_buf, int32_t buf_cap) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)obs_handle;
+    if (!obs) return -2;
+
+    pthread_mutex_lock(&obs->queue_mutex);
+
+    if (!obs->queue_head && timeout_ms > 0) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec  += timeout_ms / 1000;
+        ts.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        while (!obs->queue_head) {
+            int rc = pthread_cond_timedwait(&obs->queue_cond, &obs->queue_mutex, &ts);
+            if (rc == ETIMEDOUT) break;
+        }
+    }
+
+    if (!obs->queue_head) {
+        pthread_mutex_unlock(&obs->queue_mutex);
+        return -1;
+    }
+
+    kinax_event_node *ev = obs->queue_head;
+
+    int n = snprintf(json_buf, (size_t)buf_cap,
+                     "{\"notification\":\"%s\",\"element_handle\":%llu,\"timestamp_ms\":%lld}",
+                     ev->notification ? ev->notification : "",
+                     (unsigned long long)ev->element_handle,
+                     (long long)ev->timestamp_ms);
+    if (n < 0 || n >= buf_cap) {
+        // Buffer too small. Leave event in queue so caller's resize+retry
+        // can still consume it; return required size (n + 1 NUL).
+        pthread_mutex_unlock(&obs->queue_mutex);
+        return n < 0 ? -2 : (n + 1);
+    }
+
+    obs->queue_head = ev->next;
+    if (!obs->queue_head) obs->queue_tail = NULL;
+    pthread_mutex_unlock(&obs->queue_mutex);
+
+    free(ev->notification);
+    free(ev);
+    return 0;
+}
+
+void kinax_observer_close(uintptr_t obs_handle) {
+    kinax_observer_struct *obs = (kinax_observer_struct *)obs_handle;
+    if (!obs) return;
+
+    if (obs->worker_runloop) {
+        CFRunLoopStop(obs->worker_runloop);
+        // Nudge the runloop so CFRunLoopStop takes effect even if it's
+        // currently idle without a wakeup source.
+        CFRunLoopWakeUp(obs->worker_runloop);
+    }
+    pthread_join(obs->worker_thread, NULL);
+
+    // Drain any leftover events; caller never picked them up.
+    pthread_mutex_lock(&obs->queue_mutex);
+    kinax_event_node *node = obs->queue_head;
+    while (node) {
+        kinax_event_node *next = node->next;
+        if (node->element_handle) {
+            CFRelease((CFTypeRef)node->element_handle);
+        }
+        free(node->notification);
+        free(node);
+        node = next;
+    }
+    obs->queue_head = obs->queue_tail = NULL;
+    pthread_mutex_unlock(&obs->queue_mutex);
+
+    pthread_mutex_destroy(&obs->queue_mutex);
+    pthread_cond_destroy(&obs->queue_cond);
+    pthread_mutex_destroy(&obs->startup_mutex);
+    pthread_cond_destroy(&obs->startup_cond);
+    free(obs);
+}

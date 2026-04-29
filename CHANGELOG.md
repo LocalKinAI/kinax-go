@@ -5,6 +5,121 @@ All notable changes to kinax-go are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-04-29
+
+The headline addition is **push-based AX event subscriptions via
+`Observer`**. Wraps `AXObserverCreate` + `AXObserverGetRunLoopSource`
++ `CFRunLoopRun` so callers can subscribe to UI changes (focus
+moves, value edits, window creates) and consume them via a Go
+channel — instead of polling the AX tree every N ms looking for
+deltas. The pattern is a direct port of AXSwift's `Observer` shape
+done right (worker thread + condvar queue + clean Close). 5-claw
+agents that previously had to re-`ui tree` after every input action
+to "see what changed" can now drive off real signals.
+
+### Added — `kinax.Observer`
+
+```go
+obs, err := kinax.NewObserver(pid)
+if err != nil { ... }
+defer obs.Close()
+
+obs.Subscribe(app,
+    kinax.NotifFocusedWindowChanged,
+    kinax.NotifWindowCreated)
+
+events := obs.Events(ctx, 100*time.Millisecond)
+for ev := range events {
+    fmt.Println(ev.Notification, ev.Element)
+    ev.Element.Close()  // caller owns the freshly-CFRetain'd handle
+}
+```
+
+API:
+
+- `NewObserver(pid int) (*Observer, error)` — creates observer +
+  spins a dedicated worker thread running CFRunLoopRun.
+- `(o) Subscribe(elem, notifications ...string)` — register
+  subscriptions; aggregates errors so one bad name doesn't abort
+  the rest.
+- `(o) Unsubscribe(elem, notification)` — remove a subscription.
+- `(o) Next(timeout time.Duration) (*Event, error)` — block-with-
+  timeout for the next event. Returns `ErrObserverTimeout` when
+  empty.
+- `(o) Events(ctx, pollInterval) <-chan Event` — goroutine-friendly
+  streaming wrapper.
+- `(o) Close()` — stop the worker, drain pending events, free
+  AXObserver. Idempotent.
+
+`Event` carries the notification name, the element it fired on
+(freshly CFRetain'd, caller's responsibility to `Close()`), and a
+timestamp.
+
+Constants for the common notifications: `NotifFocusedWindowChanged`,
+`NotifFocusedUIElementChanged`, `NotifValueChanged`,
+`NotifTitleChanged`, `NotifWindowCreated`, `NotifMenuOpened`,
+`NotifApplicationActivated`, ...
+
+### Implementation
+
+ObjC side appended to `objc/kinax_ax.m` (no new file — same dylib):
+
+- `kinax_observer_create(pid, ...)` — spawns a `pthread` whose entry
+  function calls `AXObserverCreate`, attaches the run-loop source
+  to that thread's CFRunLoop, then `CFRunLoopRun()`'s.
+- AX callback on the worker pushes notification + retained element
+  + timestamp onto a FIFO guarded by `pthread_mutex_t` +
+  `pthread_cond_t`.
+- `kinax_observer_next` blocks the caller's thread on
+  `pthread_cond_timedwait` until an event lands or timeout fires.
+- `kinax_observer_close` sets the runloop to stop (with
+  `CFRunLoopWakeUp` so it takes effect on idle), `pthread_join`'s,
+  drains the queue (releasing leftover elements), frees everything.
+
+Startup synchronization: a separate `pthread_cond_t` lets
+`kinax_observer_create` block until the worker thread has either
+successfully created the AXObserver or failed (with a copyable
+error string). No polling sleep loop.
+
+### Tests — `observer_test.go`
+
+10 cases covering the pure-Go bits:
+
+- `NewObserver` rejects pid<=0
+- `Close` is nil-safe and idempotent
+- `Subscribe` / `Unsubscribe` / `Next` on closed observer return
+  `ErrObserverClosed`
+- `parseEvent` handles valid JSON, NUL-terminated buffers, malformed
+  input, empty buffers
+- Notification name constants are stable (drift = silent
+  subscription no-ops)
+
+End-to-end (real AX event from a real app) needs TCC + a running
+target process — exercise manually with `cmd/kinax` examples.
+
+### Why this matters
+
+Every AX-driving agent has been polling: dump the tree, diff,
+react, repeat at 200-500ms cadence. That's wasted IPC and a
+~half-second floor on responsiveness. Observer flips it to push:
+when the user's focused window changes, your agent gets a signal
+in single-digit milliseconds. KinClaw v1.7+ uses this for "agent
+reacts to user activity" workflows that were structurally
+impossible before.
+
+Pairs naturally with v0.2's `Element.GetMany`: Observer tells you
+*when* something changed, GetMany lets you cheaply re-fetch the
+relevant attributes when it does.
+
+### Threading note (still binding)
+
+Apple AX is main-thread-only per
+[Forums #94878](https://developer.apple.com/forums/thread/94878).
+The dylib enforces this internally via the dedicated worker thread
+per Observer; the AX callback fires on that thread, never on
+caller's goroutine. Go callers can use Observer from any goroutine
+safely — synchronization happens inside the dylib.
+
 ## [0.2.0] - 2026-04-28
 
 The headline addition is **`Element.GetMany`** — batch attribute fetch
