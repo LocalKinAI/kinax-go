@@ -69,7 +69,7 @@ import (
 )
 
 // Version is the semantic-version tag of this package.
-const Version = "0.1.0"
+const Version = "0.2.0"
 
 // DylibPath is an optional override for the location of libkinax_sync.dylib.
 // Default (empty): extract embedded copy to cache directory.
@@ -96,6 +96,7 @@ var (
 	attrPointFn        func(uintptr, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	attrSizeFn         func(uintptr, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
 	attrElementArrayFn func(uintptr, unsafe.Pointer, unsafe.Pointer, unsafe.Pointer) int32
+	attrManyFn         func(uintptr, unsafe.Pointer, unsafe.Pointer, int32) int32
 	attributeNamesFn   func(uintptr, unsafe.Pointer, int32) int32
 	actionNamesFn      func(uintptr, unsafe.Pointer, int32) int32
 	elementPerformFn   func(uintptr, unsafe.Pointer) int32
@@ -139,6 +140,7 @@ func Load() error {
 		purego.RegisterLibFunc(&attrPointFn, h, "kinax_element_attr_point")
 		purego.RegisterLibFunc(&attrSizeFn, h, "kinax_element_attr_size")
 		purego.RegisterLibFunc(&attrElementArrayFn, h, "kinax_element_attr_element_array")
+		purego.RegisterLibFunc(&attrManyFn, h, "kinax_element_attr_many")
 		purego.RegisterLibFunc(&attributeNamesFn, h, "kinax_element_attribute_names")
 		purego.RegisterLibFunc(&actionNamesFn, h, "kinax_element_action_names")
 		purego.RegisterLibFunc(&elementPerformFn, h, "kinax_element_perform")
