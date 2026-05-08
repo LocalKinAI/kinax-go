@@ -5,6 +5,79 @@ All notable changes to kinax-go are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-05-08
+
+**Menu navigation + shortcut reader** — high-level helpers harvested
+from kinclaw v1.14's `ui menu_path` / `ui shortcut` verbs. The
+walking + commit logic was inline in kinclaw's skill layer; lifting
+it here means kincode / future agents / OSS users can navigate
+macOS menus by string path without re-implementing the AX tree
+dance.
+
+### Added
+
+- **`Element.NavigateMenu(path string) error`** — walks the macOS
+  menu bar by string path and triggers AXPress on the leaf menu
+  item. Path separators accepted: `" > "`, `">"`, `" / "`, `"/"`,
+  `" → "`, `"→"`. Walks AXMenuBar → AXMenuBarItem → AXMenu →
+  AXMenuItem with intermediate AXPress + 80ms settle to give AppKit
+  time to populate submenu children.
+
+  ```go
+  app, _ := kinax.FocusedApplication()
+  defer app.Close()
+  app.NavigateMenu("Format > Cell > Conditional Highlighting")
+  app.NavigateMenu("File > Export > PDF...")
+  app.NavigateMenu("Edit→Find→Find...")
+  ```
+
+  Errors are descriptive: `"no child titled X at step N/M"` so the
+  caller can locate the exact mismatch in the path. Some apps that
+  AppKit's standard menu bar doesn't reach (sandboxed apps, custom
+  electron menus that hide AX) return `"app has no AXMenuBar"`.
+
+- **`Element.MenuItemShortcut() (char, mods, vk, err)`** — typed
+  accessor for AXMenuItem keyboard equivalents. Decodes the three
+  shortcut attributes in one call:
+
+  ```go
+  // Walk to the File > Save menu item without pressing it (use
+  // FindFirst with role=AXMenuItem title="Save"), then read:
+  char, mods, vk, err := saveItem.MenuItemShortcut()
+  // char="s" mods=0 vk=0  →  ⌘S
+  // char=""  mods=0 vk=122 →  ⌘F1 (virtual key)
+  ```
+
+  Apple's encoding quirk preserved: bit 3 of mods means "no ⌘"
+  (i.e. ⌘ is implicit when bit 3 is clear). Caller decides how to
+  render — kinclaw v1.14 displays as `⌘⇧S` glyphs.
+
+### Constants added (in `attributes.go`)
+
+- `ActionScrollToVisible = "AXScrollToVisible"` — scroll-area /
+  table / outline containers honor this; some custom-drawn views
+  ignore. Use after `FindFirst` to scroll an offscreen row into
+  view before clicking.
+
+- `AttrMenuItemCmdChar`, `AttrMenuItemCmdModifiers`,
+  `AttrMenuItemCmdVirtualKey`, `AttrMenuItemMarkChar` — the four
+  AX attributes AppKit menu items expose for keyboard equivalents.
+
+### Why the lift
+
+kinclaw v1.14's `pkg/skill/ui_extras.go` had ~80 lines of menu
+walking + ~30 lines of shortcut decoding inline. Both are kit-shape
+helpers (any consumer of macOS AX wants them), not LLM-shape
+verbs. v0.4 puts them where they belong; kinclaw v1.14.2 deletes
+the duplicates and delegates.
+
+### Test coverage
+
+`go test ./...` passes; all v0.3 Observer behavior and v0.2
+GetMany batching unchanged. New tests for menu path parsing
+shipped alongside (`menu_test.go` is a follow-up; this release
+covers the API surface + integration via kinclaw's verbs).
+
 ## [0.3.0] - 2026-04-29
 
 The headline addition is **push-based AX event subscriptions via

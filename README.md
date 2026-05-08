@@ -44,6 +44,17 @@ kinax at-point 200 100
 - **App targeting** — `FocusedApplication`, `ApplicationByPID`,
   `ApplicationByBundleID`, `SystemWide`.
 - **Action + write** — `Perform("AXPress")`, `SetString`, `SetBool`.
+- **Menu navigation** (v0.4) — `Element.NavigateMenu("File > New
+  Window")` walks the AX menu tree and presses the leaf;
+  `MenuItemShortcut()` reads the keyboard equivalent (e.g. `⌘⇧N`)
+  without firing the action.
+- **Push-based event subscriptions** (v0.3) — `Observer` +
+  `Subscribe` deliver `AXFocusedUIElementChanged` /
+  `AXValueChanged` / etc. via a Go channel; CFRunLoop is
+  internalized.
+- **Batch attribute fetch** (v0.2) — `Element.GetMany(names...)`
+  issues a single `AXUIElementCopyMultipleAttributeValues` call
+  instead of N round-trips.
 - **No cgo**: downstream projects stay pure Go. The ObjC companion
   dylib is `//go:embed`ded (~70 KB universal arm64+x86_64) and
   extracted to `~/Library/Caches` on first call.
@@ -230,32 +241,38 @@ Go code  ─── purego.Dlopen ────► libkinax_sync.dylib (embedded)
 - JSON encoding for list attributes (attribute names, action names) —
   avoids shipping a full CF→Go type system across the FFI.
 
-## Known limitations (v0.1)
+## Known limitations (current as of v0.4)
 
 - **macOS only.** The Accessibility API is macOS-specific — no
   cross-platform ambitions.
-- **Read-heavy API.** Writing is limited to string and bool attribute
-  sets. CGPoint/CGSize/CGRect AXValue setters (e.g. to move a window
-  programmatically) are deferred to v0.2.
-- **No observers / notifications.** `AXObserverRef` +
-  `kAXFocusedWindowChangedNotification` etc. are planned for v0.2 —
-  they enable agents to *react* to UI changes rather than polling.
 - **Numeric attributes only as int64.** Float-valued attributes
-  (`AXValue` on sliders) currently string-stringify. Dedicated
-  `AttributeFloat` planned for v0.2.
+  (`AXValue` on sliders) currently string-stringify. `AttributeFloat`
+  planned for v0.5.
+- **CGPoint/CGSize setters not exposed yet.** Window-move via
+  `SetPosition` / `SetSize` planned for v0.5.
 - **Single main thread assumption** for some CF calls. In practice
-  `kinax` works from any goroutine because we don't use CFRunLoop.
+  `kinax` works from any goroutine because we don't use CFRunLoop
+  except inside the [Observer] subsystem.
 - **Tested only on macOS 26.3 arm64** so far; Intel + macOS 14/15
   verification pending CI.
 
 ## Roadmap
 
-- **v0.2** — AXObserver subscription (`OnNotification` callback), more
-  typed setters (`SetPoint`, `SetSize`), `AttributeFloat`.
-- **v0.3** — helpers for common idioms: `WaitForWindow(bundleID, title, timeout)`,
-  `TypeInFieldLabeled(app, label, text)`, "did the UI change" snapshots.
-- **Cross-app automation recipes** — Safari URL read, screenshot a
-  specific window via sckit-go + AXFrame, etc.
+- **v0.2** — `Element.GetMany` batch attribute fetch via
+  `AXUIElementCopyMultipleAttributeValues`. **Shipped 2026-04-19.**
+- **v0.3** — Push-based AX event subscriptions
+  (`Observer` + `Subscribe` + `Next` / `Events` channel).
+  **Shipped 2026-04-29.**
+- **v0.4** — `Element.NavigateMenu(path)` + `MenuItemShortcut()`
+  + menu/action constants. **Shipped 2026-05-08.**
+- **v0.5** (planned) — typed numeric attributes (`AttributeFloat`),
+  geometry setters (`SetPosition` / `SetSize`), `WaitForWindow`
+  high-level convenience.
+- **v0.6** (planned) — `FindMenuItem(path)` (split off from
+  `NavigateMenu` so callers can introspect the leaf without firing
+  the action; needed by kinclaw's `ui shortcut` reading path),
+  `Element.Snapshot()` + `Snapshot.Diff()` for state-change
+  verification.
 
 ## Contributing
 
