@@ -95,4 +95,19 @@ const (
 	ActionShowAlternateUI = "AXShowAlternateUI"
 	ActionShowDefaultUI   = "AXShowDefaultUI"
 	ActionPick            = "AXPick"
+	// AXScrollToVisible asks scroll-area / table / outline containers
+	// to bring the receiver into view. Most table / list elements
+	// honor this; some custom-drawn views ignore it.
+	ActionScrollToVisible = "AXScrollToVisible"
+)
+
+// Menu-item shortcut attribute names (stable strings from
+// <HIServices/AXAttributeConstants.h>; the ones AppKit menu items
+// expose for keyboard equivalents). Use these with [Element.Attribute]
+// / [Element.AttributeInt] when reading shortcuts.
+const (
+	AttrMenuItemCmdChar       = "AXMenuItemCmdChar"
+	AttrMenuItemCmdModifiers  = "AXMenuItemCmdModifiers"
+	AttrMenuItemCmdVirtualKey = "AXMenuItemCmdVirtualKey"
+	AttrMenuItemMarkChar      = "AXMenuItemMarkChar"
 )
